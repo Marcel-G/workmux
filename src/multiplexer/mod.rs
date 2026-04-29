@@ -677,6 +677,13 @@ pub trait Multiplexer: Send + Sync {
 
                 handshake.wait()?;
 
+                // Wait for the shell to become fully interactive before sending
+                // keys. The handshake fires before `exec <shell> -l`, so without
+                // this the send_keys can arrive while the shell is still
+                // initializing (zsh flushes its input buffer during startup,
+                // silently discarding the command).
+                handshake::wait_for_prompt(self, &spawned_id)?;
+
                 // Inject resume/continue arguments for agent panes when requested
                 if let Some(selected_agent) = resolved.selected_agent.as_mut() {
                     match &options.resume_mode {

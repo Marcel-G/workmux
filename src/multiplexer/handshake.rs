@@ -39,6 +39,16 @@ pub trait PaneHandshake: Send {
 /// Timeout for waiting for pane readiness (seconds)
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
+/// Timeout for waiting for shell prompt after handshake (seconds).
+///
+/// More generous than the handshake timeout because shell initialization
+/// can be slow (direnv, devenv, nvm, conda activate, etc.). The handshake
+/// confirms the shell process exists; this confirms it's interactive.
+const PROMPT_WAIT_TIMEOUT_SECS: u64 = 10;
+
+/// Poll interval when waiting for shell prompt (milliseconds).
+const PROMPT_POLL_INTERVAL_MS: u64 = 50;
+
 /// Manages the tmux wait-for handshake protocol for pane synchronization.
 ///
 /// This struct encapsulates the channel-based handshake mechanism that ensures
@@ -295,5 +305,151 @@ impl Drop for UnixPipeHandshake {
     fn drop(&mut self) {
         // Clean up the pipe file if it still exists
         let _ = std::fs::remove_file(&self.pipe_path);
+    }
+}
+
+/// Wait for a shell prompt to appear in the pane, indicating the shell is
+/// fully interactive and ready to receive commands.
+///
+/// The existing handshake signals readiness *before* `exec <shell> -l`, so
+/// `send_keys` can arrive while the shell is still initializing. This function
+/// bridges that gap by polling `capture_pane` until the prompt is visible.
+///
+/// Best-effort: if the timeout expires (e.g. unusual prompt that doesn't match
+/// our heuristic), we log a warning and return `Ok(())` so `send_keys` proceeds
+/// anyway. This preserves backwards compatibility for exotic setups.
+pub fn wait_for_prompt<M: super::Multiplexer + ?Sized>(mux: &M, pane_id: &str) -> Result<()> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(PROMPT_WAIT_TIMEOUT_SECS);
+    let poll_interval = Duration::from_millis(PROMPT_POLL_INTERVAL_MS);
+
+    debug!(pane_id = %pane_id, "waiting for shell prompt");
+
+    loop {
+        if let Some(content) = mux.capture_pane(pane_id, 5) {
+            if has_shell_prompt(&content) {
+                debug!(
+                    pane_id = %pane_id,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "shell prompt detected"
+                );
+                return Ok(());
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            warn!(
+                pane_id = %pane_id,
+                timeout_secs = PROMPT_WAIT_TIMEOUT_SECS,
+                "timed out waiting for shell prompt, proceeding anyway"
+            );
+            return Ok(());
+        }
+
+        thread::sleep(poll_interval);
+    }
+}
+
+/// Check if captured pane content contains a shell prompt on the last non-empty line.
+///
+/// Strips ANSI escape codes first, then checks whether the last non-blank line
+/// ends with a character commonly used as a prompt suffix.
+fn has_shell_prompt(content: &str) -> bool {
+    let stripped = console::strip_ansi_codes(content);
+
+    let last_line = stripped.lines().rev().find(|line| !line.trim().is_empty());
+
+    let Some(line) = last_line else {
+        return false;
+    };
+
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Common prompt-ending characters:
+    // $  - bash default, zsh with some themes
+    // %  - zsh default
+    // #  - root shells
+    // >  - nushell, powershell, some custom prompts
+    // ❯  - starship, pure, powerlevel10k
+    // ➜  - oh-my-zsh robbyrussell theme
+    // ›  - some custom prompts
+    matches!(
+        trimmed.chars().last(),
+        Some('$' | '%' | '#' | '>' | '❯' | '➜' | '›')
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_bash_dollar_prompt() {
+        assert!(has_shell_prompt("user@host:~$"));
+        assert!(has_shell_prompt("user@host:~/dev $"));
+    }
+
+    #[test]
+    fn detects_zsh_percent_prompt() {
+        assert!(has_shell_prompt("user@host %"));
+        assert!(has_shell_prompt("%"));
+    }
+
+    #[test]
+    fn detects_root_hash_prompt() {
+        assert!(has_shell_prompt("root@host:~#"));
+        assert!(has_shell_prompt("# "));
+    }
+
+    #[test]
+    fn detects_starship_prompt() {
+        assert!(has_shell_prompt("~/dev ❯"));
+        assert!(has_shell_prompt("❯"));
+    }
+
+    #[test]
+    fn detects_ohmyzsh_arrow_prompt() {
+        // robbyrussell theme puts ➜ at the start, not the end.
+        // The full line is like "➜  workmux git:(main) ✗" — we won't detect
+        // that, but the prompt cursor appears after a trailing space which we
+        // can't distinguish. This is an accepted limitation; the timeout
+        // fallback handles these cases gracefully.
+        assert!(has_shell_prompt("➜"));
+    }
+
+    #[test]
+    fn detects_nushell_prompt() {
+        assert!(has_shell_prompt("~>"));
+        assert!(has_shell_prompt("/home/user >"));
+    }
+
+    #[test]
+    fn detects_prompt_with_ansi_codes() {
+        // Simulated colored prompt: \x1b[32muser@host\x1b[0m $
+        assert!(has_shell_prompt("\x1b[32muser@host\x1b[0m $"));
+        assert!(has_shell_prompt("\x1b[1;34m~/dev\x1b[0m \x1b[33m❯\x1b[0m"));
+    }
+
+    #[test]
+    fn skips_blank_trailing_lines() {
+        assert!(has_shell_prompt("user@host:~$\n\n\n"));
+        assert!(has_shell_prompt("some output\nuser@host %\n  \n"));
+    }
+
+    #[test]
+    fn rejects_empty_content() {
+        assert!(!has_shell_prompt(""));
+        assert!(!has_shell_prompt("\n\n\n"));
+        assert!(!has_shell_prompt("   \n   "));
+    }
+
+    #[test]
+    fn rejects_content_without_prompt() {
+        assert!(!has_shell_prompt("Loading direnv..."));
+        assert!(!has_shell_prompt("Welcome to Ubuntu 22.04"));
+        assert!(!has_shell_prompt("Last login: Mon Apr 28"));
     }
 }
